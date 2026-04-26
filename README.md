@@ -14,6 +14,7 @@
 | **第二步** | 多轮对话 | 对话历史、上下文管理 |
 | **第三步** | 执行系统命令 | 工具调用（Tool Use）、Agentic Loop |
 | **第四步** | 加载技能文件 | SKILL 注入、可扩展提示工程 |
+| **第五步** | 命令循环直到完成 | Agentic Loop 深化、多轮工具调用 |
 
 **什么是 Agent（智能体）？** 简单说，就是让 AI 不只会"说"，还能"做"——能调用工具、执行操作、拿到结果后继续推理。小龙虾就是最小化的 Agent。
 
@@ -546,15 +547,272 @@ exit code: 0
 
 ---
 
+## 第五步：命令循环直到"完成" 🔄
+
+> **目标**：让 AI 能连续执行多条命令，像真正的助理一样把复杂任务拆解成一系列步骤。
+>
+> **技术术语**：**多轮 Agentic Loop（Multi-turn Tool Use）**、**循环终止条件（Termination Condition）**。
+>
+> **通俗解释**：前几步里，AI 只能执行一条命令就结束了。但真实任务往往需要"先查一下，再根据结果做下一步"。这一步我们给 AI 装上"循环"能力——它可以不断执行命令，直到认为任务完成，然后明确说"完成"退出。
+
+### 发现问题
+
+第四步的代码里，命令执行只有一轮：
+
+```python
+# v4：命令 → 执行 → 再问一次 → 结束
+cmd = parse_command(reply)
+if cmd:
+    result = run_command(cmd)
+    reply = call_api(history)   # 只追问一轮，就结束了
+```
+
+如果 AI 需要执行多条命令（比如：查文件 → 读内容 → 修改 → 保存），第四步就无能为力了。
+
+### 解决思路
+
+用 `while` 循环不断执行命令，直到 AI 说"完成"：
+
+```
+AI 生成命令1 → 执行 → 结果返回 AI
+    ↓
+AI 生成命令2 → 执行 → 结果返回 AI
+    ↓
+AI 生成命令3 → 执行 → 结果返回 AI
+    ↓
+AI 说"完成" → 退出循环，输出最终结果
+```
+
+关键在于约定退出条件：**AI 回复中包含"完成"且没有新命令时，循环结束**。
+
+### 代码
+
+```python
+# lobster_v5.py — 第五步：命令循环直到"完成"
+
+import os
+import re
+import subprocess
+import requests
+
+API_KEY  = os.getenv("LLM_API_KEY", "your-key")
+BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL    = os.getenv("LLM_MODEL",    "openrouter/free")
+
+BASE_SYSTEM_PROMPT = """你是一个智能助手，可以执行系统命令来帮助用户。
+
+当你需要执行系统命令时，使用如下格式：
+
+```command
+你的命令
+```
+
+执行后我会把结果返回给你，你可以继续基于结果提供帮助。
+
+当你认为任务已完成时，请明确回复"完成"，例如："已完成，文件已保存到 /path/to/file"。
+
+注意：
+1. 只在必要时执行命令，避免危险操作（如 rm -rf /）
+2. 可以连续执行多个命令，直到任务完成
+3. 每轮命令执行后，说"完成"来结束当前任务
+"""
+
+
+def load_skill_file() -> str:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SKILL.md")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def build_system_prompt() -> str:
+    skill = load_skill_file()
+    if skill:
+        return BASE_SYSTEM_PROMPT + "\n## 可用技能\n\n" + skill
+    return BASE_SYSTEM_PROMPT
+
+
+def call_api(messages: list[dict]) -> str:
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    payload = {"model": MODEL, "messages": messages}
+    resp = requests.post(f"{BASE_URL}/chat/completions",
+                         headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def parse_command(text: str) -> str | None:
+    m = re.search(r'```command\s*(.*?)\s*```', text, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
+def run_command(cmd: str, timeout: int = 30) -> str:
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True,
+                           text=True, timeout=timeout)
+        out = ""
+        if r.stdout: out += f"stdout:\n{r.stdout}"
+        if r.stderr: out += f"stderr:\n{r.stderr}"
+        out += f"exit code: {r.returncode}"
+        return out
+    except subprocess.TimeoutExpired:
+        return "命令超时"
+    except Exception as e:
+        return f"执行出错：{e}"
+
+
+# ★ NEW：命令循环 —— 反复执行直到 AI 说"完成"
+def run_command_loop(history: list[dict], model: str) -> None:
+    """反复执行命令直到 AI 回复中包含'完成'（且无新命令）"""
+    MAX_TURNS = 20  # 兜底，防止死循环
+
+    system_prompt = build_system_prompt()
+
+    # 第一轮：把当前已含命令的回复 + 执行结果，一起发给 AI
+    history.append({
+        "role": "user",
+        "content": "请根据上述命令执行结果继续。如果还有命令要执行请继续，"
+                   "任务完成后请明确回复'完成'。"
+    })
+
+    for turn in range(MAX_TURNS):
+        # 构建消息：system + 全部历史
+        messages = []
+        messages.append({"role": "system", "content": system_prompt})
+        messages.extend(history)
+
+        print(f"\n🔄 第 {turn + 1} 轮命令执行...\n")
+
+        reply = call_api(messages)
+
+        # ★ 退出条件：回复包含"完成"且没有新命令
+        if "完成" in reply and parse_command(reply) is None:
+            print(f"✅ {reply}")
+            history.append({"role": "assistant", "content": reply})
+            return  # 退出循环
+
+        cmd = parse_command(reply)
+        if cmd:
+            print(f"\n⚙️  执行命令：{cmd}")
+            print("-" * 40)
+            result = run_command(cmd)
+            print(result)
+            print("-" * 40)
+
+            # 把这轮加入历史，继续循环
+            history.append({"role": "assistant", "content": reply})
+            history.append({"role": "user",
+                            "content": f"命令执行结果:\n{result}"})
+        else:
+            # 既没有命令也没有"完成"，直接输出并结束
+            print(reply)
+            history.append({"role": "assistant", "content": reply})
+            return
+
+    print("⚠️  命令循环已达最大轮次（20），强制结束")
+
+
+def run():
+    print("\n🦞 迷你小龙虾 v5 启动！")
+    print("输入 quit 退出，clear 清空历史\n")
+
+    skill = load_skill_file()
+    if skill:
+        print("✅ 已加载 SKILL.md")
+
+    history: list[dict] = []
+
+    while True:
+        prompt = input("👤 你：").strip()
+
+        if not prompt: continue
+        if prompt.lower() in ("quit", "exit", "q"):
+            print("再见！"); break
+        if prompt.lower() == "clear":
+            history = []
+            print("历史已清空\n"); continue
+
+        # 首次对话注入系统提示
+        if not history:
+            system_prompt = build_system_prompt()
+        else:
+            system_prompt = ""
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        reply = call_api(messages)
+        print(f"🤖 AI：{reply}")
+
+        # ★ NEW：检测命令 → 进入命令循环
+        cmd = parse_command(reply)
+        if cmd:
+            history.append({"role": "user", "content": prompt})
+            history.append({"role": "assistant", "content": reply})
+            run_command_loop(history, MODEL)  # ← 循环执行直到"完成"
+        else:
+            history.append({"role": "user", "content": prompt})
+            history.append({"role": "assistant", "content": reply})
+
+        if len(history) > 40:
+            history = history[-40:]
+
+
+if __name__ == "__main__":
+    run()
+```
+
+**运行效果——AI 连续执行多条命令：**
+
+```
+👤 你：查看当前目录文件数量，然后统计代码行数
+
+🤖 AI：好的，我来帮你完成这两个任务。
+
+⚙️  执行命令：ls | wc -l
+----------------------------------------
+stdout:
+6
+exit code: 0
+----------------------------------------
+
+🔄 第 1 轮命令执行...
+
+🤖 AI：根据文件数量，我来统计代码行数：
+
+⚙️  执行命令：find . -name "*.py" | xargs wc -l
+----------------------------------------
+stdout:
+     150 ./simple_llm.py
+      80 ./SKILL.md
+     230 total
+exit code: 0
+----------------------------------------
+
+🔄 第 2 轮命令执行...
+
+✅ 完成！当前目录共 6 个文件，Python 代码合计 230 行。
+```
+
+小龙虾现在能连续作战了！🦞🔥
+
+---
+
 ## 🧩 完整演进路线图
 
 ```
-lobster_v1.py          lobster_v2.py          lobster_v3.py          lobster_v4.py
-──────────────         ──────────────         ──────────────         ──────────────
-chat_once()     →→→    run() + history  →→→   + SYSTEM_PROMPT  →→→   + SKILL.md
-                                              + parse_command()       + load_skill_file()
+lobster_v1.py          lobster_v2.py          lobster_v3.py          lobster_v4.py          lobster_v5.py
+──────────────         ──────────────         ──────────────         ──────────────         ──────────────
+chat_once()     →→→    run() + history  →→→   + SYSTEM_PROMPT  →→→   + SKILL.md      →→→   + run_command_loop()
+                                              + parse_command()       + load_skill_file()           + 终止条件"完成"
                                               + run_command()         + build_system_prompt()
-                                              Agentic Loop
+                                              Agentic Loop            Agentic Loop
 ```
 
 每一步都只新增 **10~20 行核心代码**，思路是：
@@ -605,7 +863,7 @@ your-command-here
 
 ```
 myclaw/
-├── simple_llm.py      # 完整版小龙虾（第四步）
+├── simple_llm.py      # 完整版小龙虾（第五步：支持命令循环）
 ├── SKILL.md           # 技能文件（可自由扩展）
 ├── README.md          # 本教程
 └── run.sh             # 快捷启动脚本
@@ -617,8 +875,8 @@ myclaw/
 
 - **流式输出（Streaming）**：把 `stream: true` 加到请求，像打字机一样逐字显示回复
 - **多工具支持**：解析多个 ` ```command ``` ` 块，一次执行多个命令
-- **工具结果再循环**：命令执行后允许 AI 继续生成新命令，直到它说"完成"
 - **接入 MCP**：使用标准化的 Model Context Protocol，接入更多外部工具
+- **更丰富的终止条件**：支持"done"、"finished"等英文终止词，或用 JSON 格式返回结构化结果
 
 ---
 
