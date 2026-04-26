@@ -5,11 +5,10 @@ Custom LLM Chat Script
 """
 
 import os
-import json
 import requests
 import subprocess
 import re
-from typing import Optional, Dict, Any
+from typing import Optional
 
 
 class CustomClient:
@@ -84,22 +83,16 @@ def get_system_prompt() -> str:
 你的命令
 ```
 
-例如：
-```command
-ls -la
-```
-或
-```command
-pwd
-```
-
 执行命令后，我会将输出结果返回给你，你可以继续基于结果提供帮助。
+
+当你认为任务已完成时，请明确回复"完成"，例如："已完成，文件已保存到 /path/to/file"。
 
 注意事项：
 1. 只在必要时才执行命令
 2. 命令应该简洁明确
 3. 避免执行危险操作（如 rm -rf /）
-4. 如果需要执行复杂操作，请先说明你的意图
+4. 可以连续执行多个命令，直到任务完成
+5. 每轮命令执行后，说"完成"来结束当前任务
 {skills_section}
 """
 
@@ -137,7 +130,66 @@ def parse_command_response(content: str) -> Optional[str]:
     return None
 
 
-def interactive_chat(client: LLMClient, model: str = "openrouter/free"):
+def _build_with_system(system_prompt: str, history: list[dict]) -> list[dict]:
+    """构建消息列表：system + history（不额外追加 user 消息）"""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history)
+    return messages
+
+
+def run_command_loop(client: CustomClient, model: str, history: list[dict],
+                      user_prompt: str) -> str:
+    """反复执行命令直到 AI 说"完成"。history 不应包含 user_prompt 本轮内容。"""
+    max_turns = 20  # 防止无限循环
+    system_prompt = get_system_prompt()
+
+    # 第一轮：把用户原始请求和 AI 第一条回复（已含命令）作为上下文，
+    # 再追问 AI 执行结果
+    history.append({
+        "role": "user",
+        "content": "请根据上述命令执行结果继续。如果还有命令要执行请继续，"
+                   "任务完成后请明确回复'完成'。"
+    })
+
+    for turn in range(max_turns):
+        messages = _build_with_system(system_prompt, history)
+
+        print(f"\n🔄 第 {turn + 1} 轮命令执行...\n")
+
+        response = client.chat(messages, model=model)
+        print(response)
+
+        # 说"完成"（且无新命令）→ 退出循环
+        if "完成" in response and parse_command_response(response) is None:
+            history.append({"role": "assistant", "content": response})
+            return response
+
+        # 提取新命令
+        command = parse_command_response(response)
+        if command:
+            print(f"\n⚙️  执行命令：{command}")
+            print("-" * 40)
+            output = execute_command(command)
+            print(output)
+            print("-" * 40)
+
+            history.append({"role": "assistant", "content": response})
+            history.append({
+                "role": "user",
+                "content": f"命令执行结果:\n{output}"
+            })
+        else:
+            # 既没有命令也没有"完成"，直接输出并结束
+            history.append({"role": "assistant", "content": response})
+            return response
+
+    print("⚠️  命令循环已达最大轮次（20），强制结束")
+    return ""
+
+
+def interactive_chat(client: CustomClient, model: str = "openrouter/free"):
     """交互式聊天模式"""
     print("\n" + "="*60)
     print("欢迎使用 Custom LLM Chat!")
@@ -145,86 +197,69 @@ def interactive_chat(client: LLMClient, model: str = "openrouter/free"):
     print("输入 'clear' 清空对话历史")
     print("输入 'history' 查看对话历史")
     print("="*60 + "\n")
-    
-    system_prompt = get_system_prompt()
+
     history: list[dict] = []
-    
+
     # 检查 SKILL.md 是否存在
     skills = get_skills_content()
     if skills:
         print("✅ 已加载 SKILL.md 技能文件")
-    
+
     while True:
         try:
             prompt = input("\n👤 你：").strip()
-            
+
             if not prompt:
                 continue
-            
+
             if prompt.lower() in ["quit", "exit", "q"]:
                 print("再见！")
                 break
-            
+
             if prompt.lower() == "clear":
                 history = []
                 print("对话历史已清空")
                 continue
-            
+
             if prompt.lower() == "history":
                 if history:
                     print("\n--- 对话历史 ---")
                     for msg in history:
                         role = "👤 你" if msg["role"] == "user" else "🤖 AI"
-                        print(f"{role}: {msg['content'][:100]}...")
+                        content = msg["content"]
+                        if len(content) > 150:
+                            content = content[:150] + "..."
+                        print(f"{role}: {content}")
                 else:
                     print("暂无对话历史")
                 continue
-            
-            # 构建消息并发送（首次对话包含系统提示）
+
+            # 首次对话包含系统提示
             include_system = len(history) == 0
-            messages = build_messages(prompt, history, include_system, system_prompt if include_system else "")
-            
+            system_prompt = get_system_prompt() if include_system else ""
+            messages = build_messages(prompt, None, include_system, system_prompt)
+
             print("🤖 AI: ", end="", flush=True)
-            
+
             response = client.chat(messages, model=model)
-            
+            print(response)
+
             # 检查是否包含命令
             command = parse_command_response(response)
             if command:
-                print("\n")
-                print(f"⚙️  检测到命令：{command}")
-                print("-" * 40)
-                
-                # 执行命令
-                command_output = execute_command(command)
-                print(command_output)
-                print("-" * 40)
-                
-                # 将命令输出添加到历史
+                # 进入命令循环
+                history.append({"role": "user", "content": prompt})
                 history.append({"role": "assistant", "content": response})
-                history.append({
-                    "role": "user",
-                    "content": f"命令执行结果:\n{command_output}"
-                })
-                
-                # 将命令结果发送给 AI，获取最终回复
-                print("🤖 AI: ", end="", flush=True)
-                followup_messages = build_messages("请根据以上命令执行结果继续回答。", history)
-                final_response = client.chat(followup_messages, model=model)
-                print(final_response)
-                
-                # 更新历史
-                history.append({"role": "assistant", "content": final_response})
+                run_command_loop(client, model, history, prompt)
             else:
-                print(response)
-                # 更新历史
+                # 没有命令，正常加入历史
+                history.append({"role": "user", "content": prompt})
                 history.append({"role": "assistant", "content": response})
-            
+
             # 限制历史长度，避免 token 溢出
-            if len(history) > 24:
-                # 只保留最近的 24 条用户/AI 对话
-                history = history[-24:]
-                
+            if len(history) > 40:
+                history = history[-40:]
+
         except KeyboardInterrupt:
             print("\n\n再见！")
             break
