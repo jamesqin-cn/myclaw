@@ -391,9 +391,9 @@ exit code: 0
 
 当用户询问天气时，执行：
 
-\`\`\`command
+&#96;&#96;&#96;command
 curl -s "https://wttr.in/城市名?format=%t%l%w"
-\`\`\`
+&#96;&#96;&#96;
 
 示例：北京天气 → curl -s "https://wttr.in/北京?format=%t%l%w"
 ```
@@ -856,9 +856,9 @@ python3 simple_llm.py
 
 当用户询问 XXX 时，执行：
 
-\`\`\`command
+&#96;&#96;&#96;command
 your-command-here
-\`\`\`
+&#96;&#96;&#96;
 ```
 
 无需重启，下次 `clear` 后即可生效。
